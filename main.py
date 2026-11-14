@@ -18,6 +18,9 @@ series and ~3% on the practice cases' late checkpoints; on the 5 practice
 checkpoints with known answers it was worse, so the edge is small and the
 coefficient is kept deliberately small (0.20) to limit downside.
 
+Rebuilt 2026-11-15 in a session started after the competition opened;
+model, coefficients and caps are unchanged from the first build.
+
 Standard library only, no network, deterministic, well under the 8s cap.
 Reads every *.in in MAKEFUN_INPUT_DIR (default /input) and writes one
 *.out per case to MAKEFUN_OUTPUT_DIR (default /output).
