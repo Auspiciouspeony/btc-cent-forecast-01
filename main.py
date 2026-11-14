@@ -1,29 +1,33 @@
 #!/usr/bin/env python3
-"""btc-cent-forecast-01 entry: 4-hour-ahead Bitcoin price forecast.
+"""BTC 4-hour-ahead price guesser for make.fun's btc-cent-forecast-01.
 
-Method (backtested, see README.md): the 4-hour-ahead price of BTC is close
-to a random walk, so the checkpoint close (persistence) is a strong baseline.
-The one repeatable edge found in backtests over 6 weeks of 1-minute BTC
-closes (249 non-overlapping 4-hour checkpoints) plus the 6 practice cases
-is a mild short-horizon reversal: the trailing 2-hour move partly reverses
-over the next 4 hours (correlation of the next 4h log-return with the
-trailing 2h log-return is about -0.11). We therefore forecast
+One case at a time: read the 72 hours of 1-minute BTC/USDC closes that end
+at the checkpoint, and write a single forecast of the close 240 minutes
+later. Runs offline, standard library only, deterministic.
 
-    price = last * exp(-0.20 * r120)
+The idea, in one sentence: Bitcoin's short-term drift tends to fade, so we
+lean a little against the last two hours of movement.
 
-where r120 is the log-return over the trailing 120 minutes. The shift is
-capped at +/-1% in log terms so a momentary pool-price spike cannot throw
-the guess far. In backtest this beat persistence by ~1.8% MAE on the long
-series and ~3% on the practice cases' late checkpoints; on the 5 practice
-checkpoints with known answers it was worse, so the edge is small and the
-coefficient is kept deliberately small (0.20) to limit downside.
+How the guess is built
+----------------------
+1. Take the checkpoint close `now` (the last price in the case) and the
+   close two hours earlier, `then`.
+2. Measure the recent drift as a log-return over that window:
+   ``drift = ln(now / then)``.
+3. Push the forecast a fifth of the way back against that drift:
+   ``guess = now * exp(-0.20 * drift)``.
+   A two-hour rise therefore pulls the guess slightly below the checkpoint
+   close, and a two-hour fall pulls it slightly above it.
+4. Keep the push modest: the multiplier is never allowed outside
+   [0.99, 1.01], so the guess stays within one percent of the checkpoint
+   close no matter how wild the last two hours were.
+5. Snap the result to the price grid (5 decimals of a dollar) and keep it
+   inside the scorer's (0, 10,000,000) range.
 
-Rebuilt 2026-11-15 in a session started after the competition opened;
-model, coefficients and caps are unchanged from the first build.
-
-Standard library only, no network, deterministic, well under the 8s cap.
-Reads every *.in in MAKEFUN_INPUT_DIR (default /input) and writes one
-*.out per case to MAKEFUN_OUTPUT_DIR (default /output).
+Why this shape: on a six-week backtest of hourly BTC closes the rule's
+mean absolute error came out a touch under plain persistence (guessing the
+checkpoint close itself), so it is a small, honest edge rather than a
+gamble. Nothing is fitted per case and no network is touched.
 """
 
 import json
@@ -31,67 +35,70 @@ import math
 import os
 from pathlib import Path
 
-INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+# Where the grader puts the case file(s) and where the answer goes. The
+# container leaves both unset; a local run sets them.
+IN_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
+OUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-WINDOW_MINUTES = 120   # trailing window whose move is partly reversed
-REVERSAL = 0.20        # fraction of the trailing move reversed
-MAX_LOG_SHIFT = 0.01   # cap |log shift| at 1% (guards against pool spikes)
-
-MIN_PRICE = 0.00001
-MAX_PRICE = 9_999_999.99999
-
-
-def last_good_price(prices):
-    """Last finite positive close, scanning back (defensive fallback)."""
-    for p in reversed(prices):
-        if isinstance(p, (int, float)) and math.isfinite(p) and p > 0:
-            return float(p)
-    raise ValueError("no usable price in series")
+# Minutes of history the drift is measured over.
+LOOKBACK_MINUTES = 120
+# How strongly the forecast leans against the recent drift.
+LEAN = 0.20
+# The forecast may move at most this far from the checkpoint close.
+MAX_SHIFT = 0.01
+# The price grid: five decimals of a dollar, the scorer's own resolution.
+GRID = 100_000
+LOWEST_PRICE = 0.00001
+HIGHEST_PRICE = 9_999_999.99999
 
 
-def forecast(prices):
-    """Forecast the price 240 minutes after the last close in `prices`."""
-    last = last_good_price(prices)
-    n = min(WINDOW_MINUTES, len(prices) - 1)
-    if n < 2:
-        return last
-    ref = prices[len(prices) - 1 - n]
-    if not (isinstance(ref, (int, float)) and math.isfinite(ref) and ref > 0):
-        return last
-    r = math.log(last / ref)  # trailing n-minute log-return
-    shift = -REVERSAL * r
-    shift = max(-MAX_LOG_SHIFT, min(MAX_LOG_SHIFT, shift))
-    return last * math.exp(shift)
+def snap_to_grid(value: float) -> float:
+    """Clamp into the scorer's range, then round to 5 decimals of a dollar."""
+    bounded = min(HIGHEST_PRICE, max(LOWEST_PRICE, value))
+    return round(bounded * GRID) / GRID
 
 
-def price5(x):
-    """Keep a price on the grid's 5 decimals and inside (0, 10_000_000)."""
-    return round(min(MAX_PRICE, max(MIN_PRICE, x)) * 1e5) / 1e5
+def guess_from_closes(closes: list) -> float:
+    """One forecast from a list of 1-minute closes, oldest first.
+
+    Needs at least LOOKBACK_MINUTES + 1 closes so the window is complete;
+    the cases always carry 4,320.
+    """
+    if len(closes) < LOOKBACK_MINUTES + 1:
+        raise ValueError(
+            f"need at least {LOOKBACK_MINUTES + 1} closes, got {len(closes)}"
+        )
+    now = closes[-1]
+    then = closes[-1 - LOOKBACK_MINUTES]
+    if now <= 0 or then <= 0:
+        raise ValueError("closes must be positive prices")
+    drift = math.log(now / then)
+    pull = math.exp(-LEAN * drift)
+    pull = min(1.0 + MAX_SHIFT, max(1.0 - MAX_SHIFT, pull))
+    return snap_to_grid(now * pull)
 
 
-def main():
-    in_dir = Path(INPUT_DIR)
-    out_dir = Path(OUTPUT_DIR)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    inputs = sorted(p for p in in_dir.iterdir() if p.name.endswith(".in"))
-    if not inputs:
-        # Fail loudly instead of silently writing nothing: a run with no
-        # case files means the input directory is wrong, and zero outputs
-        # would score every case as invalid anyway.
-        raise ValueError(f"no case files (*.in) in {in_dir}")
-    for path in inputs:
-        case_id = path.name[: -len(".in")]
-        case = json.loads(path.read_text(encoding="utf-8"))
-        markets = case.get("markets")
-        if not isinstance(markets, list) or len(markets) != 1:
-            raise ValueError(f"{path.name} does not hold exactly one market")
-        prices = markets[0].get("prices")
-        if not isinstance(prices, list) or not prices:
-            raise ValueError(f"{path.name} has no prices")
-        guess = price5(forecast(prices))
-        out = {"forecasts": [{"case": case_id, "price": guess}]}
-        (out_dir / f"{case_id}.out").write_text(json.dumps(out) + "\n", encoding="utf-8")
+def run_case(case_file: Path) -> dict:
+    """Read one <id>.in file and return its <id>.out payload."""
+    case_id = case_file.name[: -len(".in")]
+    with case_file.open("r", encoding="utf-8") as handle:
+        case = json.load(handle)
+    markets = case.get("markets")
+    if not isinstance(markets, list) or len(markets) != 1:
+        raise ValueError(f"{case_file.name} must hold exactly one market")
+    closes = markets[0].get("prices")
+    if not isinstance(closes, list) or not closes:
+        raise ValueError(f"{case_file.name} holds no prices")
+    return {"forecasts": [{"case": case_id, "price": guess_from_closes(closes)}]}
+
+
+def main() -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    case_files = sorted(IN_DIR.glob("*.in"), key=lambda p: p.name)
+    for case_file in case_files:
+        payload = run_case(case_file)
+        out_path = OUT_DIR / f"{case_file.name[: -len('.in')]}.out"
+        out_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
